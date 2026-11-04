@@ -17,7 +17,7 @@ This is a SINGLE-FILE version: everything lives in this one app.py, in labelled 
     MAIN                   startup, welcome screen, sidebar, routing
 
 Files it uses next to app.py:  inventory.json, scrapfit_images/, scrapfit_hero_photo.png
-Files it creates:              users.json (accounts), backups/, inventory.json.bak
+Files it creates:              users.json (accounts), transactions.json (collections/reviews), backups/, inventory.json.bak
 """
 
 import copy
@@ -68,6 +68,7 @@ def _path_from_env(variable, default):
 # so your existing listings and photos are picked up automatically.
 DATA_FILE = _path_from_env("SCRAPFIT_DATA_FILE", PROJECT_DIR / "inventory.json")
 USERS_FILE = _path_from_env("SCRAPFIT_USERS_FILE", PROJECT_DIR / "users.json")
+TRANSACTIONS_FILE = _path_from_env("SCRAPFIT_TRANSACTIONS_FILE", PROJECT_DIR / "transactions.json")
 IMAGE_DIR = _path_from_env("SCRAPFIT_IMAGE_DIR", PROJECT_DIR / "scrapfit_images")
 BACKUP_DIR = _path_from_env("SCRAPFIT_BACKUP_DIR", PROJECT_DIR / "backups")
 HERO_IMAGE = PROJECT_DIR / "scrapfit_hero_photo.png"
@@ -148,12 +149,26 @@ def is_local_url(url):
 
 
 def get_admin_emails():
-    """Optional comma-separated SCRAPFIT_ADMIN_EMAILS: these accounts may claim old,
-    ownerless listings that came from the original prototype."""
-    raw = os.environ.get("SCRAPFIT_ADMIN_EMAILS", "")
+    """Read configured admin emails from environment variables or Streamlit secrets.
+
+    Supported Streamlit secrets formats:
+      ADMIN_EMAILS = "admin@example.com,owner@example.com"
+
+      [admin]
+      id = "admin@example.com"
+    """
+    raw = os.environ.get("SCRAPFIT_ADMIN_EMAILS", "").strip()
     try:
         import streamlit as st
-        raw = raw or str(st.secrets.get("ADMIN_EMAILS", ""))
+        secrets = st.secrets
+        if not raw:
+            raw = str(secrets.get("ADMIN_EMAILS", "")).strip()
+        if not raw:
+            admin_section = secrets.get("admin", {})
+            if hasattr(admin_section, "get"):
+                raw = str(admin_section.get("id", "")).strip()
+        if not raw:
+            raw = str(secrets.get("admin_id", "")).strip()
     except Exception:
         pass
     return {item.strip().lower() for item in raw.split(",") if item.strip()}
@@ -746,6 +761,8 @@ EXTRA_CSS = """
     .sf-badge-sold { background: #ECE9E4; color: #5F5A52; border: 1px solid #DAD5CC; }
     .sf-badge-unavailable { background: #EFE6E6; color: #7A3B3B; border: 1px solid #E0CFCF; }
     .sf-badge-neutral { background: #F0F5EF; color: #47745B; border: 1px solid #E0E8DF; }
+    .sf-badge-verified { background: #E4F0FF; color: #174A83; border: 1px solid #C5DAF3; }
+    .sf-badge-trusted { background: #E5F4EC; color: #175B37; border: 1px solid #BFE2CC; }
     .sf-welcome-note { color: #D9E8DC; font-size: .95rem; line-height: 1.6; }
     .sf-user-chip { background: #EAF3E9; border: 1px solid #D7E6D7; border-radius: 12px; padding: 10px 12px;
         color: #173F34; font-size: .88rem; line-height: 1.5; margin-bottom: 8px; }
@@ -1414,11 +1431,7 @@ def _check_image_bytes(data, filename):
 
 
 def save_uploaded_photos(uploaded_files, image_dir=None):
-    """Validate and save uploaded files; return the list of saved file names.
-
-    `uploaded_files` are Streamlit UploadedFile objects (anything with .name and
-    .getvalue()). Either all photos are saved or none are.
-    """
+    """Validate and save listing photos locally or to Supabase Storage."""
     image_dir = Path(image_dir or IMAGE_DIR)
     files = list(uploaded_files or [])
     if len(files) > MAX_PHOTOS_PER_LISTING:
@@ -1435,8 +1448,28 @@ def save_uploaded_photos(uploaded_files, image_dir=None):
         _check_image_bytes(data, uploaded.name)
         prepared.append((suffix, data))
 
-    image_dir.mkdir(parents=True, exist_ok=True)
     saved = []
+    if supabase_is_configured():
+        bucket = get_supabase_client().storage.from_(SUPABASE_PHOTO_BUCKET)
+        mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+        try:
+            for suffix, data in prepared:
+                name = f"photo_{uuid.uuid4().hex[:12]}{suffix}"
+                bucket.upload(f"photos/{name}", data, file_options={
+                    "content-type": mime.get(suffix, "application/octet-stream"),
+                    "cache-control": "3600", "upsert": "false",
+                })
+                saved.append(name)
+        except Exception as exc:
+            if saved:
+                try:
+                    bucket.remove([f"photos/{name}" for name in saved])
+                except Exception:
+                    pass
+            raise PhotoError(f"Photos could not be uploaded to Supabase: {exc}") from exc
+        return saved
+
+    image_dir.mkdir(parents=True, exist_ok=True)
     try:
         for suffix, data in prepared:
             name = f"photo_{uuid.uuid4().hex[:12]}{suffix}"
@@ -1447,31 +1480,75 @@ def save_uploaded_photos(uploaded_files, image_dir=None):
         raise PhotoError(f"Photos could not be saved: {exc}") from exc
     return saved
 
-
 def remove_photo_files(names, image_dir=None):
-    """Delete files that were saved but then not used (e.g. the listing failed to save)."""
+    """Delete local files and, in cloud mode, their matching Storage objects."""
     image_dir = Path(image_dir or IMAGE_DIR)
-    for name in names:
+    safe_names = [Path(str(name)).name for name in names]
+    for name in safe_names:
         try:
-            (image_dir / Path(name).name).unlink()
+            (image_dir / name).unlink()
         except OSError:
+            pass
+    if safe_names and supabase_is_configured():
+        try:
+            get_supabase_client().storage.from_(SUPABASE_PHOTO_BUCKET).remove(
+                [f"photos/{name}" for name in safe_names]
+            )
+        except Exception:
             pass
 
 
 def local_photo_paths(piece, image_dir=None):
-    """Paths of the listing's photos that exist on disk (placeholder SVGs from very old
-    versions are ignored, as in the original app)."""
+    """Return local image paths or public Supabase URLs for listing photos."""
     image_dir = Path(image_dir or IMAGE_DIR)
     names = list(piece.get("photos") or [])
     if not names and piece.get("image_file"):
         names = [piece["image_file"]]
     paths = []
     for name in names:
-        path = image_dir / Path(str(name)).name
+        safe_name = Path(str(name)).name
+        path = image_dir / safe_name
         if path.is_file() and path.suffix.lower() in ALLOWED_PHOTO_SUFFIXES:
+            if supabase_is_configured():
+                try:
+                    # Existing local photos are copied to Storage on first use so other
+                    # visitors can see them after the one-time JSON migration.
+                    _upload_legacy_local_photo(safe_name, path.stat().st_mtime_ns)
+                    public_url = get_supabase_client().storage.from_(SUPABASE_PHOTO_BUCKET).get_public_url(f"photos/{safe_name}")
+                    if isinstance(public_url, dict):
+                        public_url = public_url.get("publicUrl") or public_url.get("public_url")
+                    if public_url:
+                        paths.append(str(public_url))
+                        continue
+                except Exception:
+                    pass
             paths.append(str(path))
+            continue
+        if supabase_is_configured() and Path(safe_name).suffix.lower() in ALLOWED_PHOTO_SUFFIXES:
+            try:
+                public_url = get_supabase_client().storage.from_(SUPABASE_PHOTO_BUCKET).get_public_url(f"photos/{safe_name}")
+                if isinstance(public_url, dict):
+                    public_url = public_url.get("publicUrl") or public_url.get("public_url")
+                if public_url:
+                    paths.append(str(public_url))
+            except Exception:
+                pass
     return paths
 
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _upload_legacy_local_photo(filename, modified_ns):
+    """Upload an existing local photo to the cloud bucket once per file version."""
+    path = IMAGE_DIR / Path(filename).name
+    if not path.is_file():
+        return False
+    suffix = path.suffix.lower()
+    mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}.get(suffix, "application/octet-stream")
+    get_supabase_client().storage.from_(SUPABASE_PHOTO_BUCKET).upload(
+        f"photos/{Path(filename).name}", path.read_bytes(),
+        file_options={"content-type": mime, "cache-control": "3600", "upsert": "true"},
+    )
+    return True
 
 # ==============================================================================
 # ACCOUNTS: local users in users.json, password hashing
@@ -1563,9 +1640,14 @@ def public_profile(user):
 
     Password hashes and login-attempt counters are never included.
     """
+    verification = user.get("shop_verification") or {}
+    status = verification.get("status", "not_requested")
     return {
         "id": user["id"], "name": user["name"], "email": user["email"],
         "phone": user.get("phone", ""), "created_at": user.get("created_at"),
+        # Only approved shop details are exposed in public profiles.
+        "shop_verification_status": status,
+        "verified_shop_name": verification.get("shop_name") if status == "verified" else None,
     }
 
 
@@ -1656,6 +1738,12 @@ class JsonUserRepository:
             user = next((u for u in self._load() if u["id"] == user_id), None)
         return public_profile(user) if user else None
 
+    def get_by_email(self, email):
+        email = normalise_email(email)
+        with _USERS_LOCK:
+            user = next((u for u in self._load() if u.get("email") == email), None)
+        return public_profile(user) if user else None
+
     def update_profile(self, user_id, name, phone):
         """Change the display name and contact number."""
         name = str(name or "").strip()
@@ -1692,6 +1780,81 @@ class JsonUserRepository:
             user["password_hash"] = hash_password(new_password)
             self._save(users)
 
+    # ----- shop verification -----
+
+    def get_shop_verification(self, user_id):
+        """Return the account owner's full verification request, including private notes."""
+        with _USERS_LOCK:
+            user = next((u for u in self._load() if u["id"] == user_id), None)
+        return copy.deepcopy((user or {}).get("shop_verification") or {"status": "not_requested"})
+
+    def request_shop_verification(self, user_id, shop_name, shop_area, proof_details):
+        """Submit/update a manual shop-verification request. Approval is admin-only."""
+        shop_name = str(shop_name or "").strip()
+        shop_area = str(shop_area or "").strip()
+        proof_details = str(proof_details or "").strip()
+        problems = []
+        if len(shop_name) < 2 or len(shop_name) > 100:
+            problems.append("Enter a shop name between 2 and 100 characters.")
+        if len(shop_area) < 4 or len(shop_area) > 200:
+            problems.append("Enter the shop address or area (4-200 characters).")
+        if len(proof_details) < 8 or len(proof_details) > 1000:
+            problems.append("Add a short description of the business proof an admin can check (8-1000 characters).")
+        if problems:
+            raise AuthError(" ".join(problems))
+        with _USERS_LOCK:
+            users = self._load()
+            user = next((u for u in users if u["id"] == user_id), None)
+            if user is None:
+                raise AuthError("Account not found.")
+            current = user.get("shop_verification") or {}
+            if current.get("status") == "verified":
+                raise AuthError("This shop is already verified. Contact an admin if its details need changing.")
+            user["shop_verification"] = {
+                "status": "pending", "shop_name": shop_name, "shop_area": shop_area,
+                "proof_details": proof_details, "requested_at": now_iso(),
+                "reviewed_at": None, "reviewed_by": None, "admin_note": "",
+            }
+            self._save(users)
+            return copy.deepcopy(user["shop_verification"])
+
+    def list_pending_shop_verifications(self):
+        """Return pending requests for the admin queue without exposing password data."""
+        with _USERS_LOCK:
+            users = self._load()
+        pending = []
+        for user in users:
+            request = user.get("shop_verification") or {}
+            if request.get("status") == "pending":
+                pending.append({
+                    "user_id": user.get("id"), "name": user.get("name"),
+                    "email": user.get("email"), "phone": user.get("phone", ""),
+                    **copy.deepcopy(request),
+                })
+        return pending
+
+    def set_shop_verification_status(self, user_id, status, admin_user, admin_note=""):
+        """Approve/reject a shop request. Only configured admin accounts may do this."""
+        if not is_admin(admin_user):
+            raise AuthError("Only a configured ScrapFit admin can review shop verification requests.")
+        if status not in ("verified", "rejected"):
+            raise AuthError("Invalid shop verification decision.")
+        with _USERS_LOCK:
+            users = self._load()
+            user = next((u for u in users if u["id"] == user_id), None)
+            if user is None:
+                raise AuthError("Account not found.")
+            request = user.get("shop_verification") or {}
+            if request.get("status") != "pending":
+                raise AuthError("This request is no longer pending.")
+            request["status"] = status
+            request["reviewed_at"] = now_iso()
+            request["reviewed_by"] = admin_user.get("email")
+            request["admin_note"] = str(admin_note or "").strip()[:500]
+            user["shop_verification"] = request
+            self._save(users)
+            return copy.deepcopy(request)
+
     # ----- saved listings (favourites) -----
 
     def get_saved_ids(self, user_id):
@@ -1716,6 +1879,452 @@ class JsonUserRepository:
 
 
 # ==============================================================================
+# COLLECTIONS, BUYER REVIEWS AND SELLER TRUST
+# ==============================================================================
+# Reviews are only possible for a buyer account linked to a seller-recorded collection,
+# and the buyer must confirm that the handover happened before the review form unlocks.
+# In this local JSON MVP, identity and contact details are not independently verified;
+# a future cloud version should add a one-time pickup code or verified contact channel.
+
+_TRANSACTIONS_LOCK = _shared_lock("transactions")
+
+
+class TrustFeatureError(Exception):
+    """A collection, review or trust-record action could not be completed."""
+
+
+class JsonTransactionRepository:
+    """Completed collections and buyer reviews stored in transactions.json."""
+
+    def __init__(self, transactions_file=None):
+        self.transactions_file = Path(transactions_file or TRANSACTIONS_FILE)
+
+    def _load(self):
+        if not self.transactions_file.exists():
+            return {"schema_version": 1, "transactions": []}
+        try:
+            data = json.loads(self.transactions_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise TrustFeatureError(
+                f"The {self.transactions_file.name} file could not be read. It was not changed."
+            ) from exc
+        if not isinstance(data, dict) or not isinstance(data.get("transactions"), list):
+            raise TrustFeatureError(f"{self.transactions_file.name} must contain a transactions list.")
+        return data
+
+    def _save(self, data):
+        self.transactions_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.transactions_file.with_name(self.transactions_file.name + ".tmp")
+        temporary.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        try:
+            os.chmod(temporary, 0o600)
+        except OSError:
+            pass
+        temporary.replace(self.transactions_file)
+
+    def record_collection(self, listing_id, seller, buyer_email, quantity, listing_repo, user_repo):
+        """Seller records a completed handover; quantity is deducted and buyer is linked."""
+        if not seller:
+            raise TrustFeatureError("Please log in as the listing owner to record a collection.")
+        try:
+            quantity = int(quantity)
+        except (TypeError, ValueError):
+            raise TrustFeatureError("Collection quantity must be a whole number.")
+        if quantity < 1:
+            raise TrustFeatureError("Collection quantity must be at least one.")
+
+        buyer_email = normalise_email(buyer_email)
+        if not buyer_email:
+            raise TrustFeatureError("Enter the buyer's registered email address.")
+        buyer = user_repo.get_by_email(buyer_email)
+        if not buyer:
+            raise TrustFeatureError("No ScrapFit account uses that email. The buyer must register before a review can be linked.")
+        if buyer["id"] == seller["id"]:
+            raise TrustFeatureError("A seller cannot record themselves as the buyer.")
+
+        with _TRANSACTIONS_LOCK:
+            listing = listing_repo.get(listing_id)
+            if not listing:
+                raise TrustFeatureError("This listing no longer exists.")
+            if listing.get("owner_id") != seller.get("id"):
+                raise TrustFeatureError("Only the account that owns this listing can record its collection.")
+            if listing.get("status") not in ("Available", "Reserved"):
+                raise TrustFeatureError("Only an available or reserved listing can be collected.")
+            if quantity > int(listing.get("quantity") or 0):
+                raise TrustFeatureError(f"Only {listing.get('quantity', 0)} piece(s) are currently listed.")
+
+            data = self._load()
+            buyer_listing_records = [t for t in data["transactions"]
+                                     if t.get("listing_id") == listing_id and t.get("buyer_id") == buyer["id"]]
+            if any(t.get("review") for t in buyer_listing_records):
+                raise TrustFeatureError("This buyer has already reviewed this listing. Only one review per buyer and listing is allowed.")
+            if any(t.get("status") != "Disputed by buyer" for t in buyer_listing_records):
+                raise TrustFeatureError("This buyer already has a collection record for this listing. Resolve it first; a new record is allowed only after a disputed entry.")
+            if any(t.get("listing_id") == listing_id and t.get("status") == "Awaiting buyer confirmation"
+                   for t in data["transactions"]):
+                raise TrustFeatureError("Another collection for this listing is waiting for buyer confirmation. Complete or resolve it first.")
+
+            transaction = {
+                "id": uuid.uuid4().hex,
+                "listing_id": listing_id,
+                "listing_name": listing.get("name", "Scrap listing"),
+                "listing_snapshot": {
+                    "material": listing.get("material"),
+                    "material_type": listing.get("material_type"),
+                    "length": listing.get("length"),
+                    "width": listing.get("width"),
+                    "thickness": listing.get("thickness"),
+                    "quality_grade": listing.get("quality_grade"),
+                    "condition": listing.get("condition"),
+                    "area": listing.get("area"),
+                },
+                "seller_id": seller["id"],
+                "seller_name": listing.get("seller_name") or seller.get("verified_shop_name") or seller.get("name"),
+                "buyer_id": buyer["id"],
+                "buyer_name": buyer.get("name"),
+                "buyer_email": buyer.get("email"),
+                "quantity": quantity,
+                "quantity_before_collection": int(listing.get("quantity") or 0),
+                "listing_status_before_collection": listing.get("status"),
+                "status": "Awaiting buyer confirmation",
+                "recorded_at": now_iso(),
+                "recorded_by": seller.get("id"),
+                "review": None,
+            }
+            data["transactions"].append(transaction)
+            self._save(data)
+            try:
+                # Reserve the listing while waiting for the buyer; do not deduct stock yet.
+                if listing.get("status") == "Available":
+                    listing_repo.update(listing_id, {"status": "Reserved"}, seller)
+            except Exception:
+                rollback = self._load()
+                rollback["transactions"] = [t for t in rollback["transactions"] if t.get("id") != transaction["id"]]
+                self._save(rollback)
+                raise
+            return copy.deepcopy(transaction)
+
+    def pending_collection_confirmations(self, buyer_id):
+        """Collections entered by a seller that the buyer has not confirmed yet."""
+        with _TRANSACTIONS_LOCK:
+            items = copy.deepcopy(self._load()["transactions"])
+        return [t for t in items if t.get("buyer_id") == buyer_id
+                and t.get("status") == "Awaiting buyer confirmation"]
+
+    def confirm_collection(self, transaction_id, buyer, listing_repo, collected=True):
+        """Only the recorded buyer can confirm/dispute; quantity is deducted on confirmation."""
+        if not buyer:
+            raise TrustFeatureError("Please log in with the buyer account recorded for this collection.")
+        with _TRANSACTIONS_LOCK:
+            data = self._load()
+            transaction = next((t for t in data["transactions"] if t.get("id") == transaction_id), None)
+            if not transaction:
+                raise TrustFeatureError("The collection record could not be found.")
+            if transaction.get("buyer_id") != buyer.get("id"):
+                raise TrustFeatureError("Only the buyer recorded for this collection can confirm it.")
+            if transaction.get("status") != "Awaiting buyer confirmation":
+                raise TrustFeatureError("This collection has already been confirmed or disputed.")
+
+            seller = get_user_repo().get_by_id(transaction.get("seller_id"))
+            if not seller:
+                raise TrustFeatureError("The seller account for this collection could not be found.")
+            listing = listing_repo.get(transaction.get("listing_id"))
+            if not listing or listing.get("owner_id") != seller.get("id"):
+                raise TrustFeatureError("The original listing is no longer available to update. Contact the seller.")
+
+            if collected:
+                if listing.get("status") not in ("Available", "Reserved"):
+                    raise TrustFeatureError("The listing is no longer available for collection confirmation. Contact the seller to resolve it.")
+                quantity = int(transaction.get("quantity") or 0)
+                if quantity < 1 or int(listing.get("quantity") or 0) < quantity:
+                    raise TrustFeatureError("The listing quantity changed and is no longer sufficient. Contact the seller before confirming.")
+                transaction["status"] = "Buyer confirmed"
+                transaction["buyer_confirmed_at"] = now_iso()
+                self._save(data)
+                try:
+                    listing_repo.adjust_quantity(transaction["listing_id"], -quantity, seller)
+                except Exception as exc:
+                    rollback = self._load()
+                    for item in rollback["transactions"]:
+                        if item.get("id") == transaction_id:
+                            item["status"] = "Awaiting buyer confirmation"
+                            item.pop("buyer_confirmed_at", None)
+                    self._save(rollback)
+                    raise TrustFeatureError(f"Could not update the listing stock, so the confirmation was not completed: {exc}") from exc
+            else:
+                # If this request placed an Available listing on hold, restore it when denied.
+                if (transaction.get("listing_status_before_collection") == "Available"
+                        and listing.get("status") == "Reserved"
+                        and int(listing.get("quantity") or 0) == int(transaction.get("quantity_before_collection") or 0)):
+                    listing_repo.update(transaction["listing_id"], {"status": "Available"}, seller)
+                transaction["status"] = "Disputed by buyer"
+                transaction["buyer_confirmed_at"] = now_iso()
+                self._save(data)
+            return copy.deepcopy(transaction)
+
+    def pending_reviews_for_buyer(self, buyer_id):
+        with _TRANSACTIONS_LOCK:
+            items = copy.deepcopy(self._load()["transactions"])
+        return [t for t in items if t.get("buyer_id") == buyer_id
+                and t.get("status") == "Buyer confirmed" and not t.get("review")]
+
+    def submit_review(self, transaction_id, buyer, material_match, dimensions_match,
+                      condition_match, pickup_smooth, overall_rating, comment=""):
+        if not buyer:
+            raise TrustFeatureError("Please log in with the buyer account that collected this item.")
+        if material_match not in ("Yes", "Mostly", "No"):
+            raise TrustFeatureError("Choose how closely the material matched the listing.")
+        if dimensions_match not in ("As listed", "Slightly off", "Way off"):
+            raise TrustFeatureError("Choose how closely the dimensions matched the listing.")
+        if condition_match not in ("Yes", "No") or pickup_smooth not in ("Yes", "No"):
+            raise TrustFeatureError("Complete the condition and pickup questions.")
+        try:
+            stars = int(overall_rating)
+        except (TypeError, ValueError):
+            stars = 0
+        if stars not in range(1, 6):
+            raise TrustFeatureError("Select an overall rating from 1 to 5 stars.")
+        comment = str(comment or "").strip()
+        if len(comment) > 500:
+            raise TrustFeatureError("Keep the comment under 500 characters.")
+
+        with _TRANSACTIONS_LOCK:
+            data = self._load()
+            transaction = next((t for t in data["transactions"] if t.get("id") == transaction_id), None)
+            if not transaction:
+                raise TrustFeatureError("The collection record could not be found.")
+            if transaction.get("buyer_id") != buyer.get("id"):
+                raise TrustFeatureError("Only the buyer recorded for this collection can review it.")
+            if transaction.get("status") != "Buyer confirmed":
+                raise TrustFeatureError("A review is available only after you confirm the collection in your account.")
+            if transaction.get("review"):
+                raise TrustFeatureError("A review has already been submitted for this collection.")
+            transaction["review"] = {
+                "material_match": material_match,
+                "dimensions_match": dimensions_match,
+                "condition_match": condition_match,
+                "pickup_smooth": pickup_smooth,
+                "overall_rating": stars,
+                "comment": comment,
+                "submitted_at": now_iso(),
+            }
+            self._save(data)
+            return copy.deepcopy(transaction["review"])
+
+    def seller_summary(self, seller_id):
+        with _TRANSACTIONS_LOCK:
+            items = copy.deepcopy(self._load()["transactions"])
+        reviews = [t["review"] for t in items
+                   if t.get("seller_id") == seller_id and isinstance(t.get("review"), dict)]
+        count = len(reviews)
+        if not count:
+            return {"count": 0, "average": None, "accuracy": None, "badge": "New seller", "reviews": []}
+        average = sum(r.get("overall_rating", 0) for r in reviews) / count
+        # A review counts as fully accurate only when all three listing facts were exact.
+        exact = sum(1 for r in reviews if r.get("material_match") == "Yes"
+                    and r.get("dimensions_match") == "As listed"
+                    and r.get("condition_match") == "Yes")
+        accuracy = 100.0 * exact / count
+        if count >= 10 and average >= 4.5 and accuracy >= 90:
+            label = "Top Trusted"
+        elif count >= 3 and average >= 4.0 and accuracy >= 80:
+            label = "Verified Reliable"
+        elif count < 3:
+            label = "New seller"
+        else:
+            label = "Building trust"
+        return {"count": count, "average": average, "accuracy": accuracy,
+                "badge": label, "reviews": reviews}
+
+    def reviews_for_seller(self, seller_id, limit=10):
+        with _TRANSACTIONS_LOCK:
+            items = copy.deepcopy(self._load()["transactions"])
+        reviewed = [t for t in items if t.get("seller_id") == seller_id and t.get("review")]
+        reviewed.sort(key=lambda t: (t.get("review") or {}).get("submitted_at", ""), reverse=True)
+        return reviewed[:limit]
+
+
+
+# ==============================================================================
+# SUPABASE CLOUD STORAGE (JSON-compatible migration layer)
+# ==============================================================================
+# This first cloud migration keeps the existing Streamlit UI and repository contract.
+# The three existing JSON documents (inventory, users, transactions) are stored as
+# separate JSONB rows in Supabase. On first use, any existing local JSON file is
+# imported automatically. The app's existing PBKDF2 login remains in use for now;
+# this is NOT Supabase Auth and is intended as a migration-friendly prototype.
+
+SUPABASE_DOCUMENTS_TABLE = "scrapfit_documents"
+SUPABASE_PHOTO_BUCKET = "listing-photos"
+
+
+def _supabase_config():
+    """Read server-only Supabase settings from Streamlit secrets or environment."""
+    try:
+        section = st.secrets.get("supabase", {})
+        url = str(section.get("url", "") or st.secrets.get("SUPABASE_URL", "")).strip()
+        secret = str(
+            section.get("secret_key", "")
+            or section.get("service_role_key", "")
+            or st.secrets.get("SUPABASE_SECRET_KEY", "")
+            or st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
+        ).strip()
+    except Exception:
+        url = os.environ.get("SUPABASE_URL", "").strip()
+        secret = (os.environ.get("SUPABASE_SECRET_KEY", "")
+                  or os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")).strip()
+    return url, secret
+
+
+def supabase_is_configured():
+    url, secret = _supabase_config()
+    return bool(url and secret)
+
+
+@st.cache_resource(show_spinner=False)
+def get_supabase_client():
+    """One server-side client. The secret key must never be exposed to browsers."""
+    url, secret = _supabase_config()
+    if not url or not secret:
+        raise RuntimeError(
+            "Supabase is not configured. Add [supabase] url and secret_key to "
+            ".streamlit/secrets.toml, or remove the section to use local JSON files."
+        )
+    try:
+        from supabase import create_client
+    except ImportError as exc:
+        raise RuntimeError("Install the Supabase Python package with: pip install supabase") from exc
+    return create_client(url, secret)
+
+
+class SupabaseDocumentStore:
+    """Small persistence adapter for the app's existing JSON-shaped repositories."""
+
+    def __init__(self, client=None):
+        self.client = client or get_supabase_client()
+
+    def read(self, key):
+        try:
+            response = (self.client.table(SUPABASE_DOCUMENTS_TABLE)
+                        .select("payload").eq("doc_key", key).limit(1).execute())
+            rows = response.data or []
+            return copy.deepcopy(rows[0]["payload"]) if rows else None
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not read '{key}' from Supabase. Check that the SQL setup script "
+                f"has been run and the secret key is correct. Details: {exc}"
+            ) from exc
+
+    def write(self, key, payload):
+        try:
+            self.client.table(SUPABASE_DOCUMENTS_TABLE).upsert({
+                "doc_key": key,
+                "payload": payload,
+                "updated_at": now_iso(),
+            }, on_conflict="doc_key").execute()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not save '{key}' to Supabase. Check the table and API settings. Details: {exc}"
+            ) from exc
+
+
+@st.cache_resource(show_spinner=False)
+def get_supabase_document_store():
+    return SupabaseDocumentStore(get_supabase_client())
+
+
+class SupabaseListingRepository(JsonListingRepository):
+    """Cloud-backed implementation of the current listing repository contract."""
+
+    def _read_raw(self):
+        payload = get_supabase_document_store().read("inventory")
+        if payload is not None:
+            if not isinstance(payload, list):
+                raise InventoryFileError("The Supabase inventory document must contain a JSON list.")
+            return payload
+        # One-time import from the local inventory.json (or demo inventory if absent).
+        payload = super()._read_raw()
+        get_supabase_document_store().write("inventory", payload)
+        return payload
+
+    def _write(self, records):
+        get_supabase_document_store().write("inventory", records)
+
+    def create_backup(self, label="manual"):
+        records = self._read_raw()
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        target = self.backup_dir / f"inventory_{label}_{stamp}.json"
+        target.write_text(json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8")
+        return target
+
+    def _delete_unreferenced_photos(self, candidate_names, remaining_records):
+        still_used = {name for r in remaining_records for name in r.get("photos", [])}
+        to_remove = [Path(str(name)).name for name in candidate_names if Path(str(name)).name not in still_used]
+        # Continue cleaning this machine's local cache/files as well.
+        super()._delete_unreferenced_photos(candidate_names, remaining_records)
+        if to_remove and supabase_is_configured():
+            try:
+                get_supabase_client().storage.from_(SUPABASE_PHOTO_BUCKET).remove(
+                    [f"photos/{name}" for name in to_remove]
+                )
+            except Exception:
+                pass  # A failed photo cleanup must not undo a listing update.
+
+
+class SupabaseUserRepository(JsonUserRepository):
+    """Cloud-backed users document; password hashes remain server-side."""
+
+    def _load(self):
+        payload = get_supabase_document_store().read("users")
+        if payload is None:
+            payload = super()._load()  # migrate the existing users.json on first use
+            get_supabase_document_store().write("users", payload)
+        if not isinstance(payload, list):
+            raise AuthError("The Supabase users document has an invalid format.")
+        return payload
+
+    def _save(self, users):
+        get_supabase_document_store().write("users", users)
+
+
+class SupabaseTransactionRepository(JsonTransactionRepository):
+    """Cloud-backed collections and reviews document."""
+
+    def _load(self):
+        payload = get_supabase_document_store().read("transactions")
+        if payload is None:
+            payload = super()._load()  # migrate transactions.json on first use
+            get_supabase_document_store().write("transactions", payload)
+        if not isinstance(payload, dict) or not isinstance(payload.get("transactions"), list):
+            raise TrustFeatureError("The Supabase transactions document has an invalid format.")
+        return payload
+
+    def _save(self, data):
+        get_supabase_document_store().write("transactions", data)
+
+def get_transaction_repo():
+    """Return the cloud repository when configured; otherwise retain local JSON mode."""
+    return SupabaseTransactionRepository() if supabase_is_configured() else JsonTransactionRepository()
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def _cached_seller_summary(seller_id, file_mtime_ns, file_size):
+    """Avoid re-reading and re-scoring the same review file for every listing card."""
+    return get_transaction_repo().seller_summary(seller_id)
+
+
+def get_seller_trust_summary(seller_id):
+    """Cache trust summaries briefly; file metadata invalidates the cache after updates."""
+    try:
+        stat = TRANSACTIONS_FILE.stat()
+        modified, size = stat.st_mtime_ns, stat.st_size
+    except OSError:
+        modified, size = 0, 0
+    return _cached_seller_summary(str(seller_id), modified, size)
+
+
+# ============================================================================== 
 # MATCHING ENGINE: fit checks, cut-plan allocation, explanations, cost estimate
 # ==============================================================================
 # ScrapFit matching engine - plain Python, no Streamlit, easy to unit test.
@@ -1909,13 +2518,16 @@ def expand_part_quantities(parts):
     return expanded
 
 
-def allocate_project_parts(material, parts, inventory, allowance_per_side=5, min_grade=None):
+def allocate_project_parts(material, parts, inventory, allowance_per_side=5, min_grade=None, pickup_strategy="smallest"):
     """Plan a simple 2-D shelf cutting layout across available offcuts.
 
     Several required parts may be cut from one physical offcut. Listing quantity means
     the number of separate physical offcuts available. Parts must match material and
     thickness exactly; rotation is allowed. Each part gets allowance on all edges.
-    Only Available listings that meet `min_grade` are used.
+    Only Available listings that meet `min_grade` are used. `pickup_strategy` may be
+    `smallest` (original waste-first behaviour) or `fewest_locations` (prefer a location
+    that can cover the most requirements, then keep assignments within already-selected
+    pickup locations where possible).
 
     This deterministic shelf-packing heuristic is intentionally explainable; it is not
     a guarantee of globally optimal nesting and does not model blade kerf or grain.
@@ -1940,6 +2552,38 @@ def allocate_project_parts(material, parts, inventory, allowance_per_side=5, min
                 "used_width": 0,
                 "assigned": [],
             })
+
+    def location_key(piece):
+        """Normalised pickup area used to reduce the number of collection stops."""
+        area = str(piece.get("area") or "").strip()
+        place = str(piece.get("pickup_location") or "").strip()
+        return (area or place or "Location not specified").casefold()
+
+    # In location-aware mode, start with the area that can independently supply
+    # the greatest number of different requirements. This avoids choosing an
+    # arbitrary tiny offcut's area as the first collection point.
+    preferred_location = None
+    if pickup_strategy == "fewest_locations" and bins:
+        location_coverage = {}
+        for bin_state in bins:
+            key = location_key(bin_state["piece"])
+            coverage = location_coverage.setdefault(key, set())
+            for part_index, part in enumerate(parts):
+                stock = bin_state["piece"]
+                if (stock.get("material") == material
+                        and int(stock.get("thickness", 0) or 0) == int(part.get("thickness", 0) or 0)):
+                    need_l = int(part.get("length", 0) or 0) + 2 * int(allowance_per_side)
+                    need_w = int(part.get("width", 0) or 0) + 2 * int(allowance_per_side)
+                    stock_l = int(stock.get("length", 0) or 0)
+                    stock_w = int(stock.get("width", 0) or 0)
+                    if ((stock_l >= need_l and stock_w >= need_w)
+                            or (stock_l >= need_w and stock_w >= need_l)):
+                        coverage.add(part_index)
+        if location_coverage:
+            preferred_location = max(
+                location_coverage,
+                key=lambda key: (len(location_coverage[key]), key),
+            )
 
     def fit_options(bin_state, part):
         stock = bin_state["piece"]
@@ -2020,14 +2664,28 @@ def allocate_project_parts(material, parts, inventory, allowance_per_side=5, min
             # Reusing an already-purchased physical offcut avoids buying another listing.
             # If opening a new offcut, prefer smaller area then lower price.
             opened = bool(bin_state["assigned"])
-            score = (
-                0 if opened else 1,
-                options[0]["score"],
-                0 if opened else stock_area,
-                0 if opened else int(stock.get("price", 0) or 0),
-                bin_state["listing_index"],
-                bin_state["unit_index"],
-            )
+            if pickup_strategy == "fewest_locations":
+                used_locations = {location_key(item["piece"]) for item in bins if item["assigned"]}
+                location = location_key(stock)
+                score = (
+                    0 if location in used_locations else 1,
+                    0 if location == preferred_location else 1,
+                    0 if opened else 1,
+                    options[0]["score"],
+                    0 if opened else stock_area,
+                    0 if opened else int(stock.get("price", 0) or 0),
+                    bin_state["listing_index"],
+                    bin_state["unit_index"],
+                )
+            else:
+                score = (
+                    0 if opened else 1,
+                    options[0]["score"],
+                    0 if opened else stock_area,
+                    0 if opened else int(stock.get("price", 0) or 0),
+                    bin_state["listing_index"],
+                    bin_state["unit_index"],
+                )
             eligible.append((score, bin_state, options[0]))
         if not eligible:
             assigned_by_index[part_index] = None
@@ -2547,15 +3205,14 @@ PAGES = ["Home", "Find Scrap", "Project Planner", "Project Ideas", "List Scrap",
 # -------------------- REPOSITORIES (one shared instance per server) --------------------
 
 def get_listing_repo():
-    """A new repository object per run (cheap). It must not be cached: Streamlit re-runs this file
-    and re-creates the exception classes each time, and a cached object would raise the OLD classes
-    that the current `except ValidationError:` lines would not catch."""
-    return JsonListingRepository(sample_inventory=SAMPLE_INVENTORY)
+    """Use Supabase when configured, otherwise keep the original local JSON backend."""
+    repo_class = SupabaseListingRepository if supabase_is_configured() else JsonListingRepository
+    return repo_class(sample_inventory=SAMPLE_INVENTORY)
 
 
 def get_user_repo():
-    """A new repository object per run (see get_listing_repo)."""
-    return JsonUserRepository()
+    """Use shared cloud accounts when Supabase is configured."""
+    return SupabaseUserRepository() if supabase_is_configured() else JsonUserRepository()
 
 
 def get_inventory():
@@ -2778,6 +3435,19 @@ def render_scrap_listing(piece, key_prefix="scrap", show_save=False, show_match=
                 + badge(f"Qty {piece.get('quantity', 1)}", "sf-badge-neutral"),
                 unsafe_allow_html=True,
             )
+            if piece.get("owner_id"):
+                seller_profile = get_user_repo().get_by_id(piece.get("owner_id"))
+                if seller_profile and seller_profile.get("shop_verification_status") == "verified":
+                    st.markdown(badge("Verified Shop", "sf-badge-verified"), unsafe_allow_html=True)
+                    if seller_profile.get("verified_shop_name"):
+                        st.caption(f"Shop: {seller_profile['verified_shop_name']}")
+                trust = get_seller_trust_summary(piece.get("owner_id"))
+                if trust["count"]:
+                    trust_badges = badge(trust["badge"], "sf-badge-trusted" if trust["badge"] in ("Verified Reliable", "Top Trusted") else "sf-badge-neutral")
+                    st.markdown(trust_badges, unsafe_allow_html=True)
+                    st.caption(f"★ {trust['average']:.1f}/5 · Listing accuracy: {trust['accuracy']:.0f}% · {trust['count']} buyer-confirmed review(s)")
+                else:
+                    st.caption("New seller · no buyer reviews yet")
             kind = f" · {piece['material_type']}" if piece.get("material_type") else ""
             st.caption(f"{piece.get('material', 'Material unspecified')}{kind} · {dimensions_text(piece)}")
             st.caption(f"Thickness: {piece.get('thickness', '?')} mm · Pickup: {pickup_text(piece)}")
@@ -3025,9 +3695,9 @@ def render_home_page():
     st.markdown('<div class="sf-section-copy">The current app demonstrates the core workflow with local accounts and a local inventory file. The next improvements focus on shared online storage, smarter cutting plans and easier participation.</div>', unsafe_allow_html=True)
     left, right = st.columns(2, gap="large")
     with left:
-        st.markdown('<div class="sf-card"><h3>Available in this prototype</h3><p>• Continue as a guest, or create a local account to list scrap<br>• Browse listings with quality grades (A/B/C) and availability status<br>• Filter by category, type, size, grade, price, place and availability, then sort the results<br>• Create a manual project cut list and set quantity for each part<br>• Generate and edit an AI-assisted draft parts list in Custom Project<br>• Match requirements using rules that explain why a listing fits (or why a part has no match)<br>• View a prototype cutting plan and rough cost estimates<br>• Create, edit and delete your own listings, update quantity and photos<br>• Download a QR code that opens each listing<br>• Save favourites (kept permanently when logged in)</p><p class="sf-footnote">Listings and accounts are stored in local files (inventory.json and users.json) on the computer running the app. Demo inventory and locations should be treated as illustrative.</p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="sf-card"><h3>Available in this prototype</h3><p>• Continue as a guest, or create a local account to list scrap<br>• Browse listings with quality grades (A/B/C) and availability status<br>• Filter by category, type, size, grade, price, place and availability, then sort the results<br>• Create a manual project cut list and set quantity for each part<br>• Generate and edit an AI-assisted draft parts list in Custom Project<br>• Match requirements using rules that explain why a listing fits (or why a part has no match)<br>• View a prototype cutting plan and rough cost estimates<br>• Create, edit and delete your own listings, update quantity and photos<br>• Download a QR code that opens each listing<br>• Save favourites (kept permanently when logged in)<br>• Record completed collections and let buyers confirm the handover before they can review<br>• Display buyer-rated listing accuracy and seller trust levels<br>• Request admin-approved Verified Shop status</p><p class="sf-footnote">When Supabase is configured, listings, accounts and collection/review records are stored in shared cloud documents, and listing photos use Supabase Storage. Without Supabase settings, this app falls back to local JSON files. Demo inventory and locations should be treated as illustrative.</p></div>', unsafe_allow_html=True)
     with right:
-        st.markdown('<div class="sf-card"><h3>Planned enhancements</h3><p><strong>Online accounts</strong><br>Secure online sign-in, e-mail based password recovery and database-level ownership rules will arrive with the planned move to Supabase. The current local accounts are for development and testing.<br><br><strong>More reliable listings</strong><br>Verified workshop profiles and sellers who keep availability up to date.<br><br><strong>Smarter cutting plans</strong><br>Improve layout optimisation and account for blade kerf, grain direction and usable defects.<br><br><strong>Broader local reuse</strong><br>Shared cloud inventory and photo storage, more material types, and ways to group nearby pickups.<br><br><strong>Sustainable business model</strong><br>Explore clearly labelled promoted shop listings or advertising; consider transaction commissions only when completed sales can be tracked reliably.</p><p class="sf-footnote">These are roadmap ideas, not features currently offered by the prototype. Public QR links only work for other people once the app is deployed at a public web address.</p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="sf-card"><h3>Planned enhancements</h3><p><strong>Online accounts</strong><br>Secure online sign-in, e-mail based password recovery and database-level ownership rules will arrive with the planned move to Supabase. The current local accounts are for development and testing.<br><br><strong>Stronger trust and safety</strong><br>Add buyer-side pickup codes or verified contact channels, dispute handling and more robust evidence checks as ScrapFit moves from local JSON storage to online accounts.<br><br><strong>Smarter cutting plans</strong><br>Improve layout optimisation and account for blade kerf, grain direction and usable defects.<br><br><strong>Broader local reuse</strong><br>Shared cloud inventory and photo storage, more material types, and ways to group nearby pickups.<br><br><strong>Sustainable business model</strong><br>Explore clearly labelled promoted shop listings or advertising; consider transaction commissions only when completed sales can be tracked reliably.</p><p class="sf-footnote">The review and shop-verification workflow is available in this local prototype. Supabase accounts, cloud storage and the other items are roadmap ideas. Public QR links only work for other people once the app is deployed at a public web address.</p></div>', unsafe_allow_html=True)
 
     st.markdown('<p class="sf-footnote">Demo notice: sample listing details and approximate pickup locations are for demonstration and are not verified offers. Illustrative material photographs may not show the exact item listed. Before purchasing or building, confirm actual dimensions, material grade, condition, price, availability and collection with the seller. AI-generated part lists and cutting plans are estimates that require review.</p>', unsafe_allow_html=True)
 
@@ -3402,6 +4072,17 @@ def render_planner_page():
                 "Minimum quality", list(GRADE_CHOICES), key="project_min_grade",
                 help="Grade A is best. 'Grade B or better' accepts Grade A and B listings.",
             )
+        pickup_area_filter = st.text_input(
+            "Pickup area filter (optional)", key="project_pickup_area",
+            placeholder="e.g. Guindy, Chennai",
+            help="Only consider listings whose pickup area or pickup location contains this text.",
+        )
+        pickup_strategy_label = st.radio(
+            "Matching preference",
+            ["Smallest suitable offcuts", "Fewer pickup locations"],
+            horizontal=True, key="project_pickup_strategy",
+            help="Fewer pickup locations favours a place that can supply more parts, then tries to keep the remaining collection stops low.",
+        )
 
         cut_list_submitted = st.form_submit_button("Search for Project Materials", type="primary", use_container_width=True)
 
@@ -3412,10 +4093,16 @@ def render_planner_page():
             st.warning("This planner supports up to 30 physical pieces per search. Reduce the quantities and try again.")
         else:
             min_grade = GRADE_CHOICES[grade_label]
-            # The planner deliberately uses all available inventory; filters belong on Find Scrap.
+            # Optional area filter narrows the inventory before allocation.
+            if pickup_area_filter.strip():
+                area_query = pickup_area_filter.strip().casefold()
+                planner_available = [p for p in planner_available if area_query in (
+                    str(p.get("area", "")).casefold() + " " + str(p.get("pickup_location", "")).casefold()
+                )]
             project_results = allocate_project_parts(
                 project_material, expand_part_quantities(parts), planner_available,
                 allowance_per_side=int(project_allowance), min_grade=min_grade,
+                pickup_strategy=("fewest_locations" if pickup_strategy_label == "Fewer pickup locations" else "smallest"),
             )
             st.session_state.project_results = project_results
             st.session_state.project_title = project_name
@@ -3423,6 +4110,8 @@ def render_planner_page():
             st.session_state.project_material_saved = project_material
             st.session_state.project_allowance_saved = int(project_allowance)
             st.session_state.project_min_grade_saved = min_grade
+            st.session_state.project_pickup_area_saved = pickup_area_filter.strip()
+            st.session_state.project_pickup_strategy_saved = pickup_strategy_label
 
     if "project_results" not in st.session_state:
         return
@@ -3433,6 +4122,12 @@ def render_planner_page():
     saved_allowance = st.session_state.get("project_allowance_saved", 5)
     saved_min_grade = st.session_state.get("project_min_grade_saved")
     st.subheader(f"Matching results for: {st.session_state.project_title}")
+    saved_strategy_label = st.session_state.get("project_pickup_strategy_saved", "Smallest suitable offcuts")
+    used_areas = sorted({str(piece.get("area") or piece.get("pickup_location") or "Location not specified").strip()
+                         for _, pieces in project_results for piece in pieces})
+    st.caption(f"Matching preference: {saved_strategy_label} · Pickup stops in this plan: {len(used_areas)}")
+    if st.session_state.get("project_pickup_area_saved"):
+        st.caption(f"Pickup area filter: {st.session_state['project_pickup_area_saved']}")
 
     summary = summarize_allocation(project_results)
     assigned_results, unmatched_parts = summary["assigned"], summary["unmatched"]
@@ -3450,8 +4145,15 @@ def render_planner_page():
         ),
     )
 
+    planner_cost_inventory = [p for p in inventory if listing_is_available(p)]
+    saved_area_filter = st.session_state.get("project_pickup_area_saved", "")
+    if saved_area_filter:
+        area_query = saved_area_filter.casefold()
+        planner_cost_inventory = [p for p in planner_cost_inventory if area_query in (
+            str(p.get("area", "")).casefold() + " " + str(p.get("pickup_location", "")).casefold()
+        )]
     cost_rows, estimated_new_cost, matched_scrap_cost = project_cost_summary(
-        saved_parts, inventory, saved_material, saved_allowance, min_grade=saved_min_grade)
+        saved_parts, planner_cost_inventory, saved_material, saved_allowance, min_grade=saved_min_grade)
     st.markdown("### Approximate material cost")
     st.caption(
         "Planning estimate only. New-material estimate uses the lowest listing price per square millimetre as an "
@@ -3596,9 +4298,14 @@ def render_project_ideas_page():
 
                 cc1, cc2 = st.columns(2)
                 with cc1:
-                    custom_pickup_area = st.text_input("Pickup area (optional)", key="custom_ai_pickup_area", placeholder="e.g. Guindy, Chennai")
+                    custom_pickup_area = st.text_input("Pickup area filter (optional)", key="custom_ai_pickup_area", placeholder="e.g. Guindy, Chennai")
                 with cc2:
                     custom_allowance = st.number_input("Cutting allowance per side (mm)", min_value=0, max_value=100, value=5, step=1, key="custom_ai_allowance")
+                custom_pickup_strategy = st.radio(
+                    "Matching preference", ["Smallest suitable offcuts", "Fewer pickup locations"],
+                    horizontal=True, key="custom_ai_pickup_strategy",
+                    help="Fewer pickup locations tries to source more parts from the same area, even if some offcuts are slightly larger.",
+                )
 
                 physical_piece_count = sum(int(part["quantity"]) for part in edited_custom_parts)
                 if physical_piece_count > 30:
@@ -3660,7 +4367,8 @@ def render_project_ideas_page():
 
                 custom_signature = json.dumps({
                     "material": custom_draft["material"], "parts": expanded_custom_parts,
-                    "area": custom_pickup_area.strip().casefold(), "allowance": int(custom_allowance)
+                    "area": custom_pickup_area.strip().casefold(), "allowance": int(custom_allowance),
+                    "pickup_strategy": custom_pickup_strategy
                 }, sort_keys=True)
                 if st.button("Find matching scrap for this custom project", type="primary", key="custom_ai_match", use_container_width=True):
                     if not any(part["name"].strip() for part in edited_custom_parts):
@@ -3675,6 +4383,7 @@ def render_project_ideas_page():
                         custom_matches = allocate_project_parts(
                             custom_draft["material"], expanded_custom_parts, custom_inventory,
                             allowance_per_side=int(custom_allowance),
+                            pickup_strategy=("fewest_locations" if custom_pickup_strategy == "Fewer pickup locations" else "smallest"),
                         )
                         st.session_state["custom_ai_match_results"] = custom_matches
                         st.session_state["custom_ai_match_signature"] = custom_signature
@@ -3684,7 +4393,8 @@ def render_project_ideas_page():
                     assigned_custom = [(part, pieces[0]) for part, pieces in custom_matches if pieces]
                     missing_custom = [part for part, pieces in custom_matches if not pieces]
                     st.markdown("### Matching results")
-                    st.info(f"{len(assigned_custom)} of {len(custom_matches)} required pieces are assigned. Multiple parts may be cut from the same physical offcut when the simple layout fits; its listing price is counted only once. Rotation is allowed, and the planner includes {int(custom_allowance)} mm allowance on every edge. This is a heuristic cut plan, not an industrial nesting guarantee.")
+                    custom_areas = {str(piece.get("area") or piece.get("pickup_location") or "Location not specified").strip() for _, pieces in custom_matches for piece in pieces}
+                    st.info(f"{len(assigned_custom)} of {len(custom_matches)} required pieces are assigned across {len(custom_areas)} pickup location(s). Preference: {custom_pickup_strategy}. Multiple parts may share one physical offcut when the simple layout fits; this is a heuristic plan, not an industrial nesting guarantee.")
                     if assigned_custom:
                         shown_cut_units = {}
                         for required_part, piece in assigned_custom:
@@ -3760,8 +4470,13 @@ def render_project_ideas_page():
                     with d: pthick = st.number_input("Thickness (mm)", min_value=1, max_value=500, value=int(part["thickness"]), step=1, key=f"idea_thick_{selected_title}_{idx}")
                     with e: pqty = st.number_input("Quantity", min_value=1, max_value=100, value=int(part.get("quantity", 1)), step=1, key=f"idea_qty_{selected_title}_{idx}")
                     edited_parts.append({"name":pname, "length":int(plen), "width":int(pwid), "thickness":int(pthick), "quantity":int(pqty)})
-                idea_area = st.text_input("Pickup place (optional)", key=f"idea_area_{selected_title}", placeholder="e.g. Guindy, Chennai")
+                idea_area = st.text_input("Pickup area filter (optional)", key=f"idea_area_{selected_title}", placeholder="e.g. Guindy, Chennai")
                 idea_allowance = st.number_input("Cutting allowance per side (mm)", min_value=0, max_value=100, value=5, key=f"idea_allowance_{selected_title}")
+                idea_pickup_strategy = st.radio(
+                    "Matching preference", ["Smallest suitable offcuts", "Fewer pickup locations"],
+                    horizontal=True, key=f"idea_pickup_strategy_{selected_title}",
+                    help="Fewer pickup locations prefers a location that can supply more of the project parts, then reuses that location where possible.",
+                )
                 cost_rows, new_est, scrap_est = project_cost_summary(edited_parts, inventory, draft_material, int(idea_allowance))
                 st.markdown("### Cost estimate")
                 st.caption("Rough prototype estimate from sample listing prices, not a live supplier quote. New-material cost is an area-based proxy; each whole offcut used is counted once. Labour, transport and blade kerf are excluded.")
@@ -3772,7 +4487,11 @@ def render_project_ideas_page():
                     if idea_area.strip():
                         q = idea_area.strip().casefold()
                         idea_inventory = [x for x in idea_inventory if q in (str(x.get("area", "")).casefold()+" "+str(x.get("pickup_location", "")).casefold())]
-                    matches = allocate_project_parts(draft_material, expand_part_quantities(edited_parts), idea_inventory, allowance_per_side=int(idea_allowance))
+                    matches = allocate_project_parts(
+                        draft_material, expand_part_quantities(edited_parts), idea_inventory,
+                        allowance_per_side=int(idea_allowance),
+                        pickup_strategy=("fewest_locations" if idea_pickup_strategy == "Fewer pickup locations" else "smallest"),
+                    )
                     st.session_state.idea_match_results = matches
                     st.session_state.idea_match_title = selected_title
                 if st.session_state.get("idea_match_title") == selected_title:
@@ -3780,6 +4499,8 @@ def render_project_ideas_page():
                     found = [(part, pieces[0]) for part, pieces in matches if pieces]
                     missing = [part for part, pieces in matches if not pieces]
                     st.subheader("Matching materials")
+                    idea_used_areas = {str(piece.get("area") or piece.get("pickup_location") or "Location not specified").strip() for _, pieces in matches for piece in pieces}
+                    st.caption(f"Matching preference: {idea_pickup_strategy} · Pickup stops in this plan: {len(idea_used_areas)}")
                     if found:
                         st.caption("Several parts can share one offcut when the simple cutting layout permits it; the offcut price is counted once in the project estimate.")
                         shown_cut_units = {}
@@ -4007,6 +4728,25 @@ def _render_quick_tab(piece, user, repo):
     new_status = st.selectbox("Change availability", STATUSES, index=STATUSES.index(piece["status"]), key=f"quick_status_{pid}")
     if st.button("Update availability", key=f"quick_status_btn_{pid}", disabled=new_status == piece["status"]):
         _run_action(lambda: repo.update(pid, {"status": new_status}, user), f"Availability of {pid} changed to {new_status}.")
+
+    st.divider()
+    st.markdown("**Record a completed collection**")
+    st.caption("Use this after the buyer has collected the material. The buyer's registered email links the collection to their account, making only that buyer eligible to review this listing.")
+    if piece.get("quantity", 0) > 0 and piece.get("status") in ("Available", "Reserved"):
+        with st.form(f"record_collection_form_{pid}"):
+            buyer_email = st.text_input("Buyer's registered ScrapFit email", key=f"collection_buyer_email_{pid}")
+            collected_qty = st.number_input("Quantity collected", min_value=1, max_value=int(piece.get("quantity", 1)), value=1, step=1, key=f"collection_qty_{pid}")
+            collection_submitted = st.form_submit_button("Confirm collection & record buyer", type="primary", use_container_width=True)
+        if collection_submitted:
+            try:
+                get_transaction_repo().record_collection(pid, user, buyer_email, collected_qty, repo, get_user_repo())
+            except (TrustFeatureError, ListingError, AuthError, OSError) as exc:
+                st.error(str(exc))
+            else:
+                flash("success", f"Collection recorded for listing {pid}. The buyer must confirm the handover in Account / Profile before submitting a review.")
+                st.rerun()
+    else:
+        st.caption("A collection can be recorded only while the listing is Available or Reserved and has stock remaining.")
     if piece["quantity"] == 0:
         st.caption("No pieces left, so this listing is hidden from search and project matching.")
 
@@ -4206,6 +4946,144 @@ def _render_profile(user):
                     flash("success", "Password changed.")
                     st.rerun()
 
+    # Buyer confirmation prevents sellers from silently assigning a review to an unrelated account.
+    transaction_repo = get_transaction_repo()
+    pending_confirmations = transaction_repo.pending_collection_confirmations(user["id"])
+    st.subheader("Confirm collected materials")
+    if pending_confirmations:
+        st.caption("A seller has recorded a collection against your account. The listing is temporarily reserved; its quantity is deducted only after you confirm. Confirm only if you actually collected the material.")
+        for pending in pending_confirmations:
+            with st.container(border=True):
+                st.markdown(f"**{pending.get('listing_name', 'Collected material')}** · {pending.get('listing_id')}")
+                st.caption(f"Seller: {pending.get('seller_name') or 'ScrapFit seller'} · Quantity: {pending.get('quantity', 1)} · Recorded: {str(pending.get('recorded_at', ''))[:10]}")
+                yes_col, no_col = st.columns(2)
+                if yes_col.button("Yes, I collected this", key=f"confirm_collection_{pending['id']}", type="primary"):
+                    try:
+                        transaction_repo.confirm_collection(pending["id"], user, get_listing_repo(), collected=True)
+                    except TrustFeatureError as exc:
+                        st.error(str(exc))
+                    else:
+                        flash("success", "Collection confirmed. You can now review the seller below.")
+                        st.rerun()
+                if no_col.button("I did not collect this", key=f"dispute_collection_{pending['id']}"):
+                    try:
+                        transaction_repo.confirm_collection(pending["id"], user, get_listing_repo(), collected=False)
+                    except TrustFeatureError as exc:
+                        st.error(str(exc))
+                    else:
+                        flash("info", "The collection was flagged as disputed. It cannot generate a buyer review.")
+                        st.rerun()
+    else:
+        st.caption("No collection confirmations are waiting for you.")
+
+    # Buyer reviews: only collections confirmed by this buyer account appear here.
+    pending_reviews = transaction_repo.pending_reviews_for_buyer(user["id"])
+    st.subheader("Buyer reviews")
+    if pending_reviews:
+        st.caption("Review a seller only after you have collected the material. Each recorded collection can be reviewed once.")
+        for purchase in pending_reviews:
+            snapshot = purchase.get("listing_snapshot") or {}
+            with st.container(border=True):
+                st.markdown(f"**{purchase.get('listing_name', 'Collected material')}** · {purchase.get('listing_id')}")
+                st.caption(f"Seller: {purchase.get('seller_name') or 'ScrapFit seller'} · Quantity: {purchase.get('quantity', 1)} · Collected: {str(purchase.get('recorded_at', ''))[:10]}")
+                with st.form(f"buyer_review_form_{purchase['id']}"):
+                    material_match = st.radio("Did the material match the listing?", ["Yes", "Mostly", "No"], horizontal=True, key=f"review_material_{purchase['id']}")
+                    dimensions_match = st.radio("Were the dimensions and thickness as listed?", ["As listed", "Slightly off", "Way off"], horizontal=True, key=f"review_dimensions_{purchase['id']}")
+                    condition_match = st.radio("Was the condition as described?", ["Yes", "No"], horizontal=True, key=f"review_condition_{purchase['id']}")
+                    pickup_smooth = st.radio("Was pickup smooth and on time?", ["Yes", "No"], horizontal=True, key=f"review_pickup_{purchase['id']}")
+                    overall_rating = st.select_slider("Overall seller rating", options=[1, 2, 3, 4, 5], value=5, key=f"review_stars_{purchase['id']}", format_func=lambda n: f"{'★' * n} ({n}/5)")
+                    comment = st.text_area("Comment (optional)", max_chars=500, key=f"review_comment_{purchase['id']}")
+                    review_submitted = st.form_submit_button("Submit buyer review", type="primary")
+                if review_submitted:
+                    try:
+                        transaction_repo.submit_review(purchase["id"], user, material_match, dimensions_match, condition_match, pickup_smooth, overall_rating, comment)
+                    except TrustFeatureError as exc:
+                        st.error(str(exc))
+                    else:
+                        flash("success", "Your review was submitted and the seller's trust summary was updated.")
+                        st.rerun()
+    else:
+        st.info("No collections are waiting for your review. A seller must record a completed handover against your registered email first.")
+
+    own_trust = transaction_repo.seller_summary(user["id"])
+    own_reviews = transaction_repo.reviews_for_seller(user["id"])
+    if own_reviews or any(p.get("owner_id") == user["id"] for p in get_inventory()):
+        with st.expander("Your shop reputation", expanded=False):
+            if own_trust["count"]:
+                left, middle, right = st.columns(3)
+                left.metric("Average rating", f"{own_trust['average']:.1f}/5")
+                middle.metric("Listing accuracy", f"{own_trust['accuracy']:.0f}%")
+                right.metric("Buyer-confirmed reviews", own_trust["count"])
+                st.write(f"**Buyer trust level:** {own_trust['badge']}")
+                for reviewed_tx in own_reviews:
+                    review = reviewed_tx["review"]
+                    st.markdown(f"**{reviewed_tx.get('listing_name', 'Listing')}** · {'★' * review.get('overall_rating', 0)} · {str(review.get('submitted_at', ''))[:10]}")
+                    st.caption(f"Material: {review.get('material_match')} · Dimensions: {review.get('dimensions_match')} · Condition: {review.get('condition_match')} · Pickup: {review.get('pickup_smooth')}")
+                    if review.get("comment"):
+                        st.write(review["comment"])
+            else:
+                st.info("You are a new seller. Buyer reviews will appear here after completed collections.")
+
+    # Shop verification request and admin-controlled approval.
+    verification = repo.get_shop_verification(user["id"])
+    with st.expander("Shop verification", expanded=verification.get("status") == "pending"):
+        state = verification.get("status", "not_requested")
+        if state == "verified":
+            st.success(f"Verified Shop: {verification.get('shop_name', 'Shop')}. This badge is separate from buyer ratings.")
+            if verification.get("reviewed_at"):
+                st.caption(f"Approved on {str(verification['reviewed_at'])[:10]}.")
+        elif state == "pending":
+            st.info(f"Your verification request for **{verification.get('shop_name', 'your shop')}** is pending admin review.")
+            st.caption("Submitted details: " + str(verification.get("shop_area", "")))
+        else:
+            if state == "rejected":
+                st.warning("Your previous request was not approved. You can update the details and submit again.")
+                if verification.get("admin_note"):
+                    st.caption("Admin note: " + str(verification.get("admin_note")))
+            st.caption("Submit your shop details. A ScrapFit admin must manually check the business evidence before the public Verified Shop badge appears.")
+            with st.form("shop_verification_request_form"):
+                shop_name = st.text_input("Registered shop / workshop name", value=verification.get("shop_name", ""))
+                shop_area = st.text_input("Shop address or area", value=verification.get("shop_area", ""))
+                proof_details = st.text_area("Business proof for admin review", value=verification.get("proof_details", ""), max_chars=1000, placeholder="For example: business registration / GST details, business website, or other verifiable proof. Do not enter passwords or sensitive personal information.")
+                request_submitted = st.form_submit_button("Submit verification request", type="primary")
+            if request_submitted:
+                try:
+                    repo.request_shop_verification(user["id"], shop_name, shop_area, proof_details)
+                except AuthError as exc:
+                    st.error(str(exc))
+                else:
+                    flash("success", "Shop verification request submitted. The Verified Shop badge appears only after admin approval.")
+                    st.rerun()
+
+    if is_admin(user):
+        with st.expander("Admin: pending shop verification requests"):
+            pending_shop_requests = repo.list_pending_shop_verifications()
+            if not pending_shop_requests:
+                st.info("No shop verification requests are waiting for review.")
+            for request in pending_shop_requests:
+                st.markdown(f"**{request.get('shop_name')}** · {request.get('name')} ({request.get('email')})")
+                st.caption(f"Area: {request.get('shop_area')} · Phone: {request.get('phone') or 'Not provided'} · Submitted: {str(request.get('requested_at', ''))[:10]}")
+                st.write(f"Business proof details: {request.get('proof_details', '')}")
+                admin_note = st.text_input("Admin note (optional)", key=f"shop_admin_note_{request['user_id']}")
+                approve_col, reject_col = st.columns(2)
+                if approve_col.button("Approve & verify shop", key=f"shop_approve_{request['user_id']}", type="primary"):
+                    try:
+                        repo.set_shop_verification_status(request["user_id"], "verified", user, admin_note)
+                    except AuthError as exc:
+                        st.error(str(exc))
+                    else:
+                        flash("success", f"{request.get('shop_name')} is now marked as a Verified Shop.")
+                        st.rerun()
+                if reject_col.button("Reject request", key=f"shop_reject_{request['user_id']}"):
+                    try:
+                        repo.set_shop_verification_status(request["user_id"], "rejected", user, admin_note)
+                    except AuthError as exc:
+                        st.error(str(exc))
+                    else:
+                        flash("info", f"Verification request for {request.get('shop_name')} was rejected.")
+                        st.rerun()
+                st.divider()
+
     listing_repo = get_listing_repo()
     claimable = [p for p in get_inventory() if listing_repo.can_claim(p, user, is_admin(user))]
     if claimable:
@@ -4226,7 +5104,7 @@ def _render_profile(user):
 
     if is_admin(user):
         with st.expander("Admin: backup and export"):
-            st.caption("Admin accounts are set with SCRAPFIT_ADMIN_EMAILS. Backups are copied into the backups folder.")
+            st.caption("Set SCRAPFIT_ADMIN_EMAILS to a comma-separated list of admin email addresses in the app environment, or ADMIN_EMAILS in Streamlit secrets. Only these accounts can approve shop verification requests. Backups are copied into the backups folder.")
             if st.button("Create a backup of inventory.json now", key="admin_backup"):
                 try:
                     path = listing_repo.create_backup("manual")
@@ -4355,9 +5233,10 @@ def main():
 
     st.divider()
     st.caption(
-        "ScrapFit MVP · Local prototype · Sample data is for demonstration "
-        "only. Verify material grade, dimensions, condition and availability "
-        "before real-world use."
+        "ScrapFit MVP · Local JSON prototype · Buyer reviews require a seller-recorded collection "
+        "and buyer confirmation; shop verification requires admin approval. The prototype does "
+        "not independently verify identity or handover. Sample data is for demonstration only; "
+        "verify material grade, dimensions, condition and availability before real-world use."
     )
 
 
