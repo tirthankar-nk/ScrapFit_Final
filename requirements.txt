@@ -1,0 +1,6 @@
+streamlit
+pandas
+pydeck
+google-genai
+qrcode[pil]
+Pillow
