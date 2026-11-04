@@ -4260,10 +4260,18 @@ def render_project_ideas_page():
                         st.success("Draft generated. Review every part and edit the dimensions before matching.")
                     except Exception as exc:
                         # Do not display raw exception text, which can contain request details.
-                        if isinstance(exc, (ValueError, RuntimeError)):
-                            st.error(str(exc))
-                        else:
-                            st.error(f"Gemini could not generate the draft ({type(exc).__name__}). Check your API key, model access, internet connection, and quota. Manual Project Planner remains available.")
+                       api_key = get_gemini_api_key()
+                        error_detail = str(exc).replace(api_key, "[REDACTED]") if api_key else str(exc)
+                    
+                        print(
+                            f"[ScrapFit Gemini Error] "
+                            f"{type(exc).__name__}: {error_detail}"
+                        )
+                    
+                        st.error(
+                            f"Gemini request failed ({type(exc).__name__}). "
+                            "Check the Streamlit Cloud logs for details."
+                        )
 
             custom_draft = st.session_state.get("custom_ai_draft")
             if custom_draft:
