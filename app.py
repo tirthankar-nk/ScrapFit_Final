@@ -3072,7 +3072,7 @@ def has_own_photo(piece):
 # Optional Gemini-powered project drafting (unchanged from the original app, apart from reading
 # secrets lazily). Needs GEMINI_API_KEY; without it the manual planner still works.
 
-GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
+GEMINI_DEFAULT_MODEL = "gemini-3.1-flash-lite"
 
 
 def get_gemini_api_key():
